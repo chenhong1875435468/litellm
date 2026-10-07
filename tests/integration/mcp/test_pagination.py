@@ -1,18 +1,18 @@
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
 
 import httpx
 import pytest
 import yaml
+from integration._support.client import Gateway
+from integration._support.mcp import paginated_mcp_peer
+from integration._support.process import owned_proxy
 from mcp import ClientSession, MCPError
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import CallToolRequest, CallToolRequestParams, CallToolResult, PaginatedRequestParams
 
-from integration._support.client import Gateway
-from integration._support.mcp import paginated_mcp_peer
-from integration._support.process import owned_proxy
 from litellm.experimental_mcp_client.client import MCPClient
 from litellm.types.mcp import MCPTransport
 
@@ -138,7 +138,7 @@ def test_continuations_reauthorize_and_reject_registry_changes(tmp_path: Path, m
 
     assert os.environ.get("DATABASE_URL"), "This integration case requires disposable-database access"
 
-    async def exercise(a, b, peer, identity, owner, stranger, policy):
+    async def exercise(a, b, peer, identity, owner, stranger, policy, spare):
         owner_a = Gateway(a.client, owner, peer.url)
         owner_b = Gateway(b.client, owner, peer.url)
         stranger_b = Gateway(b.client, stranger, peer.url)
@@ -165,9 +165,9 @@ def test_continuations_reauthorize_and_reject_registry_changes(tmp_path: Path, m
             {
                 "key": owner,
                 **(
-                    {"access_group_ids": []}
+                    {"access_group_ids": [], "object_permission": {"mcp_servers": [spare]}}
                     if grant == "access_group"
-                    else {"object_permission": {"mcp_servers": ["no-mcp-servers"]}}
+                    else {"object_permission": {"mcp_servers": [spare]}}
                 ),
             },
         )
@@ -207,7 +207,7 @@ def test_continuations_reauthorize_and_reject_registry_changes(tmp_path: Path, m
             capture_output=True,
             text=True,
         )
-        with paginated_mcp_peer() as peer, httpx.Client() as client:
+        with paginated_mcp_peer() as peer, paginated_mcp_peer() as spare_peer, httpx.Client() as client:
             seed = Gateway(client, "sk-pagination-test", peer.url)
             config = tmp_path / "database-proxy.yaml"
             config.write_text(
@@ -231,6 +231,7 @@ def test_continuations_reauthorize_and_reject_registry_changes(tmp_path: Path, m
                 a.scenario() as scenario,
             ):
                 identity = register_mcp(scenario, peer, "pages")
+                spare: Final = register_mcp(scenario, spare_peer, "spare")
                 group = a.request(
                     "POST",
                     "/v1/access_group",
@@ -248,7 +249,7 @@ def test_continuations_reauthorize_and_reject_registry_changes(tmp_path: Path, m
                 owner = scenario.key(**policy)
                 stranger = scenario.key(object_permission={"mcp_servers": [identity]})
                 assert owner != stranger
-                asyncio.run(exercise(a, b, peer, identity, owner, stranger, policy))
+                asyncio.run(exercise(a, b, peer, identity, owner, stranger, policy, spare))
 
 
 @pytest.mark.parametrize("changed", ["key", "snapshot"])
@@ -470,35 +471,85 @@ def test_complete_initial_page_keeps_bare_routes_with_a_cached_database_revision
     with scratch_database() as database_url:
         monkeypatch.setenv("DATABASE_URL", database_url)
         subprocess.run(
-            [sys.executable, "-I", "-m", "prisma", "db", "push", "--schema",
-             "litellm/proxy/schema.prisma", "--skip-generate"],
-            check=True, capture_output=True, text=True,
+            [
+                sys.executable,
+                "-I",
+                "-m",
+                "prisma",
+                "db",
+                "push",
+                "--schema",
+                "litellm/proxy/schema.prisma",
+                "--skip-generate",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
         )
         subprocess.run(
-            [sys.executable, "-I", "-m", "prisma", "db", "execute", "--schema",
-             "litellm/proxy/schema.prisma", "--file",
-             "litellm-proxy-extras/litellm_proxy_extras/migrations/20260923000000_add_mcp_catalog_revision_trigger/migration.sql"],
-            check=True, capture_output=True, text=True,
+            [
+                sys.executable,
+                "-I",
+                "-m",
+                "prisma",
+                "db",
+                "execute",
+                "--schema",
+                "litellm/proxy/schema.prisma",
+                "--file",
+                "litellm-proxy-extras/litellm_proxy_extras/migrations/20260923000000_add_mcp_catalog_revision_trigger/migration.sql",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
         )
-        with paginated_mcp_peer(page_size=3) as first, paginated_mcp_peer(page_size=3) as second, httpx.Client() as client:
+        with (
+            paginated_mcp_peer(page_size=3) as first,
+            paginated_mcp_peer(page_size=3) as second,
+            httpx.Client() as client,
+        ):
             seed = Gateway(client, "sk-pagination-test", first.url)
             config = tmp_path / "database-proxy.yaml"
-            config.write_text(yaml.safe_dump({
-                "model_list": [], "general_settings": {"master_key": seed.key, "store_model_in_db": True},
-            }))
-            environment = {"DATABASE_URL": database_url, "DISABLE_SCHEMA_UPDATE": "true", "LITELLM_SALT_KEY": "shared-pagination-test"}
-            with owned_proxy(
-                seed, tmp_path / "proxy", environment, config=config, database_setup=(),
-                remove_environment=("DATABASE_URL_READ_REPLICA", "LITELLM_LICENSE", "LITELLM_LICENSE_PATH"),
-            ) as gateway, gateway.scenario() as scenario:
+            config.write_text(
+                yaml.safe_dump(
+                    {
+                        "model_list": [],
+                        "general_settings": {"master_key": seed.key, "store_model_in_db": True},
+                    }
+                )
+            )
+            environment = {
+                "DATABASE_URL": database_url,
+                "DISABLE_SCHEMA_UPDATE": "true",
+                "LITELLM_SALT_KEY": "shared-pagination-test",
+            }
+            with (
+                owned_proxy(
+                    seed,
+                    tmp_path / "proxy",
+                    environment,
+                    config=config,
+                    database_setup=(),
+                    remove_environment=("DATABASE_URL_READ_REPLICA", "LITELLM_LICENSE", "LITELLM_LICENSE_PATH"),
+                ) as gateway,
+                gateway.scenario() as scenario,
+            ):
                 first_id = register_mcp(scenario, first, "first")
                 second_id = register_mcp(scenario, second, "second")
                 owner = scenario.key(object_permission={"mcp_servers": [second_id]})
-                warm = gateway.client.get("/mcp-rest/tools/list", headers={"Authorization": "Bearer " + gateway.key}, params={"server_id": first_id})
+                warm = gateway.client.get(
+                    "/mcp-rest/tools/list",
+                    headers={"Authorization": "Bearer " + gateway.key},
+                    params={"server_id": first_id},
+                )
                 assert warm.status_code == 200, warm.text
                 # A no-op SQL writer bumps the trigger revision without changing either server.
                 write_rows('UPDATE "LiteLLM_MCPServerTable" SET "alias" = "alias" WHERE "server_id" = %s', (first_id,))
-                warm = gateway.client.get("/mcp-rest/tools/list", headers={"Authorization": "Bearer " + gateway.key}, params={"server_id": first_id})
+                warm = gateway.client.get(
+                    "/mcp-rest/tools/list",
+                    headers={"Authorization": "Bearer " + gateway.key},
+                    params={"server_id": first_id},
+                )
                 assert warm.status_code == 200, warm.text
                 query = 'SELECT "reload_revision" FROM "LiteLLM_Config" WHERE "param_name" = %s'
                 revision = read_rows(query, ("mcp_catalog",))
@@ -521,18 +572,46 @@ def test_missing_user_keeps_explicit_key_and_team_grants(
     with scratch_database() as database_url:
         monkeypatch.setenv("DATABASE_URL", database_url)
         subprocess.run(
-            [sys.executable, "-I", "-m", "prisma", "db", "push", "--schema",
-             "litellm/proxy/schema.prisma", "--skip-generate"],
-            check=True, capture_output=True, text=True,
+            [
+                sys.executable,
+                "-I",
+                "-m",
+                "prisma",
+                "db",
+                "push",
+                "--schema",
+                "litellm/proxy/schema.prisma",
+                "--skip-generate",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
         )
-        with paginated_mcp_peer(page_size=3) as allowed, paginated_mcp_peer(page_size=3) as private, httpx.Client() as client:
+        with (
+            paginated_mcp_peer(page_size=3) as allowed,
+            paginated_mcp_peer(page_size=3) as private,
+            httpx.Client() as client,
+        ):
             seed = Gateway(client, "sk-pagination-test", allowed.url)
             config = tmp_path / "database-proxy.yaml"
-            config.write_text(yaml.safe_dump({
-                "model_list": [], "general_settings": {"master_key": seed.key, "store_model_in_db": True},
-            }))
-            environment = {"DATABASE_URL": database_url, "DISABLE_SCHEMA_UPDATE": "true", "LITELLM_SALT_KEY": "shared-pagination-test"}
-            options = dict(config=config, database_setup=(), remove_environment=("DATABASE_URL_READ_REPLICA", "LITELLM_LICENSE", "LITELLM_LICENSE_PATH"))
+            config.write_text(
+                yaml.safe_dump(
+                    {
+                        "model_list": [],
+                        "general_settings": {"master_key": seed.key, "store_model_in_db": True},
+                    }
+                )
+            )
+            environment = {
+                "DATABASE_URL": database_url,
+                "DISABLE_SCHEMA_UPDATE": "true",
+                "LITELLM_SALT_KEY": "shared-pagination-test",
+            }
+            options = dict(
+                config=config,
+                database_setup=(),
+                remove_environment=("DATABASE_URL_READ_REPLICA", "LITELLM_LICENSE", "LITELLM_LICENSE_PATH"),
+            )
             with (
                 owned_proxy(seed, tmp_path / "a", environment, **options) as a,
                 owned_proxy(seed, tmp_path / "b", environment, **options) as b,
